@@ -8,6 +8,8 @@ import type { CircuitSignals, Groth16Proof } from "snarkjs";
 
 // Shared BN254 field/nullifier validation helpers (#370)
 import { assertValidFieldElement, assertValidNullifier } from "../types/index";
+import { workerAvailable, proveInWorker } from "./proveInWorker";
+import { withMaskedTiming } from "./proofTiming";
 
 // Default to the Rust prover. Force the legacy `snarkjs` prover by setting
 // `VITE_ZK_USE_RUST_PROVER=false` (Vite) or `ZK_USE_RUST_PROVER=false`
@@ -60,11 +62,77 @@ function loadRustProver(): Promise<RustProver> {
   return rustProverPromise;
 }
 
+export class WitnessValidationError extends Error {
+  constructor(message: string, public details?: unknown) {
+    super(message);
+    this.name = "WitnessValidationError";
+  }
+}
+
+/**
+ * Validates witness inputs before passing them to the witness calculator / prover WASM.
+ * Catches malformed siblings, non-field elements, depth discrepancies, and empty roots,
+ * preventing worker/prover crashes and DoS.
+ */
+export function validateWitnessInput(input: Record<string, unknown>): void {
+  for (const [key, val] of Object.entries(input)) {
+    if (val === undefined || val === null) {
+      throw new WitnessValidationError(`Witness signal "${key}" cannot be null or undefined`);
+    }
+
+    if (key === "pathElements" || key === "siblings") {
+      if (!Array.isArray(val) || val.length === 0) {
+        throw new WitnessValidationError(`Witness "${key}" must be a non-empty array of field elements`);
+      }
+      for (let i = 0; i < val.length; i++) {
+        try {
+          assertValidFieldElement(val[i], `${key}[${i}]`);
+        } catch (err: any) {
+          throw new WitnessValidationError(`Witness ${key}[${i}] validation failed: ${err.message}`);
+        }
+      }
+    } else if (key === "pathIndices") {
+      if (!Array.isArray(val) || val.length === 0) {
+        throw new WitnessValidationError(`Witness "${key}" must be a non-empty array`);
+      }
+      for (let i = 0; i < val.length; i++) {
+        const num = Number(val[i]);
+        if (num !== 0 && num !== 1) {
+          throw new WitnessValidationError(`Witness ${key}[${i}] must be 0 or 1, got ${val[i]}`);
+        }
+      }
+    } else if (key === "nullifier") {
+      try {
+        assertValidNullifier(val as string | bigint);
+      } catch (err: any) {
+        throw new WitnessValidationError(`Witness nullifier validation failed: ${err.message}`);
+      }
+    } else if (key === "root") {
+      try {
+        assertValidFieldElement(val as string | bigint, "root");
+        const b = typeof val === "string" ? BigInt(val.startsWith("0x") ? val : `0x${val}`) : (val as bigint);
+        if (b === 0n) {
+          throw new WitnessValidationError("Witness root cannot be zero (uninitialized tree root)");
+        }
+      } catch (err: any) {
+        throw new WitnessValidationError(`Witness root validation failed: ${err.message}`);
+      }
+    } else if (typeof val === "string" || typeof val === "number" || typeof val === "bigint") {
+      try {
+        assertValidFieldElement(val, key);
+      } catch (err: any) {
+        throw new WitnessValidationError(`Witness signal "${key}" validation failed: ${err.message}`);
+      }
+    }
+  }
+}
+
 async function proveWithRust(
   input: Record<string, unknown>,
   wasmPath: string | Uint8Array,
   zkeyPath: string | Uint8Array,
 ): Promise<GeneratedProof> {
+  validateWitnessInput(input);
   // Compute the witness with the circom WASM (snarkjs' engine).
   const { WitnessCalculatorBuilder } = await import("circom_runtime");
   const wasmBytes =
@@ -106,6 +174,7 @@ async function proveWithSnarkjs(
   wasmPath: string | Uint8Array,
   zkeyPath: string | Uint8Array,
 ): Promise<GeneratedProof> {
+  validateWitnessInput(input);
   // Off the main thread where the platform allows it (#92): a multi-second
   // BigInt proof on the main thread blocks rendering, which hands any script
   // on the page a timing trace via frame pacing alone. Timing masking is
@@ -136,12 +205,16 @@ export interface VoteProofInput {
   daoId: string;
   proposalId: string;
   voteChoice: string; // "0" for no, "1" for yes
-  relayerAddress: string; // Relayer Stellar address - public signal for relayer binding
+  /** Public signal: must match on-chain ElectionConfig.num_candidates (#645) */
+  numCandidates: string; // bounds voteChoice in-circuit
   commitment: string; // Identity commitment - private input, computed internally in circuit
   pathElements: string[];
   pathIndices: number[];
   circuitVersion?: string; // "v1" or "v2" (defaults to "v1")
   chainId?: string; // Required for v2 circuits
+  familyNullifier?: string; // v2 only: breaks cross-proposal linkability
+  nonce?: string; // v2 only: re-vote counter
+  relayerAddress?: string; // v2 only
 }
 
 export interface CommentProofInput {
@@ -165,7 +238,6 @@ export interface WeightedVoteProofInput extends VoteProofInput {
   weight: string; // voting weight (must equal balance commitment)
   maxWeight: string; // inclusive upper bound
   domainTag?: string; // domain separation tag (default: DOMAIN_TAG_WEIGHTED)
-  blindingFactor?: string;
 }
 
 export interface BridgeProofInput {
@@ -180,6 +252,8 @@ export interface BridgeProofInput {
   sbtLeaf: string;
   sbtContractAddr: string;
   memberAddr: string;
+  /** EVM chain id — public signal for cross-chain domain separation (#649) */
+  chainId?: string;
   votingPathElements: string[];
   votingPathIndices: number[];
   sbtPathElements: string[];
@@ -225,43 +299,6 @@ export interface GeneratedProof {
   redundantProof?: Groth16Proof;
 }
 
-/**
- * Generate a Snark proof for a final tally.
- *
- * The circuit proves that `tallyYes` and `tallyNo` are the correct sums of
- * all valid votes that were cast for a proposal. The proof is verified
- * on-chain by the `verify_tally_proof` entrypoint.
- *
- * @param input - All tally inputs (root, nullifiers, vote choices, weights,
- *                merkle paths).
- * @param wasmPath - Path to the compiled tally circuit WASM (or a Uint8Array
- *                   containing the WASM bytes).
- * @param zkeyPath - Path to the tally circuit final zkey (or a Uint8Array
- *                   containing the zkey bytes).
- * @returns The generated Groth16 proof and public signals.
- */
-export async function generateTallyProof(
-  input: TallyProofInput,
-  wasmPath: string | Uint8Array,
-  zkeyPath: string | Uint8Array,
-): Promise<GeneratedProof> {
-  // Normalize input for the circuit.
-  const circuitInput = {
-    root: input.root,
-    daoId: input.daoId,
-    proposalId: input.proposalId,
-    tallyYes: input.tallyYes,
-    tallyNo: input.tallyNo,
-    nullifiers: input.nullifiers,
-    voteChoices: input.voteChoices,
-    weights: input.weights ?? input.voteChoices.map(() => "1"),
-    pathElements: input.pathElements,
-    pathIndices: input.pathIndices,
-  } as unknown as Record<string, unknown>;
-
-  return proveWithRust(circuitInput, wasmPath, zkeyPath);
-}
-
 // ============================================
 // Versioned VK Cache (Task 1: ZK-013)
 // ============================================
@@ -276,6 +313,7 @@ export interface VersionedVK {
   hash: string;
   fetchedAt: number;
   numPublicSignals?: number;
+  vkVersion?: number; // CRITICAL (#660): Track VK version from backend
 }
 
 export class VKMismatchError extends Error {
@@ -329,9 +367,25 @@ function loadVKFromStorage(
     const raw = localStorage.getItem(key);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as VersionedVK;
+
+    // CRITICAL (#660): Validate VK integrity and version binding
+    if (!parsed.hash) {
+      console.warn(`[VK] Loaded VK from localStorage missing integrity hash for ${circuitId} v${version}`);
+      return null;
+    }
+    if (typeof parsed.version !== 'number' || parsed.version !== version) {
+      console.warn(`[VK] Version mismatch in localStorage for ${circuitId}: expected v${version}, got v${parsed.version}`);
+      return null;
+    }
+    if (typeof parsed.circuitId !== 'string' || parsed.circuitId !== circuitId) {
+      console.warn(`[VK] Circuit ID mismatch in localStorage: expected ${circuitId}, got ${parsed.circuitId}`);
+      return null;
+    }
+
     vkMemoryCache.set(vkCacheKey(circuitId, version), parsed);
     return parsed;
-  } catch {
+  } catch (e) {
+    console.warn(`[VK] Failed to load VK from localStorage for ${circuitId} v${version}:`, e);
     return null;
   }
 }
@@ -376,9 +430,11 @@ export async function fetchVersionedVK(
   }
 
   const data = await res.json();
-  // Backend returns { vk, version, hash, numPublicSignals } or { verificationKey }
+  // Backend returns { vk, version, hash, numPublicSignals, vkVersion } or { verificationKey }
   const vk = data.vk ?? data.verificationKey ?? data;
   const hash: string = data.hash ?? data.vkHash ?? (await computeVKHash(vk));
+
+  // CRITICAL (#660): Bind VK to the backend version for integrity verification
   const entry: VersionedVK = {
     circuitId,
     version: data.version ?? version,
@@ -386,6 +442,7 @@ export async function fetchVersionedVK(
     hash,
     fetchedAt: Date.now(),
     numPublicSignals: data.numPublicSignals,
+    vkVersion: data.vkVersion ?? data.version, // Store backend-provided VK version
   };
 
   // Detect stale if backend reports a newer version than requested
@@ -411,7 +468,7 @@ export function getCachedVK(
   version: number,
 ): VersionedVK | null {
   const key = vkCacheKey(circuitId, version);
-  let entry = vkMemoryCache.get(key);
+  let entry: VersionedVK | null | undefined = vkMemoryCache.get(key);
   if (!entry) entry = loadVKFromStorage(circuitId, version);
   if (!entry) return null;
   if (Date.now() - entry.fetchedAt >= VK_CACHE_TTL_MS) {
@@ -620,31 +677,50 @@ export async function generateVoteProof(
     const circuitVersion = input.circuitVersion ?? "v1";
     let circuitInput: Record<string, unknown>;
     if (circuitVersion === "v2") {
-      // vote_v2.circom: 10 public signals
+      // vote_v2.circom: 10 public signals + private blindingFactor
       circuitInput = {
         root: input.root,
         nullifier: input.nullifier,
+        familyNullifier: input.familyNullifier ?? "0",
         daoId: input.daoId,
         proposalId: input.proposalId,
         voteChoice: input.voteChoice,
+        numCandidates: input.numCandidates,
         chainId: input.chainId || "0",
-        relayerAddress: input.relayerAddress,
+        nonce: input.nonce ?? "0",
+        relayerAddress: input.relayerAddress ?? "0",
         secret: input.secret,
         salt: input.salt,
+        blindingFactor: input.blindingFactor,
         pathElements: input.pathElements,
         pathIndices: input.pathIndices,
       };
     } else {
-      // vote_v1.circom: 7 public signals (vote.circom with relayerAddress)
+      // vote.circom: 6 public signals
+      //   [root, nullifier, daoId, proposalId, voteChoice, numCandidates]
+      //
+      // `numCandidates` is not optional. The circuit range-checks
+      // `voteChoice < numCandidates` against this PUBLIC input so the contract
+      // can be sure the proof enforced the candidate bound the election was
+      // configured with. Leaving it out leaves the signal at 0, which makes
+      // `voteChoice < 0` unsatisfiable — so the witness cannot be generated at
+      // all. It was missing here, which is one reason the anonymous vote path
+      // produced no usable proofs.
+      //
+      // There is deliberately no `relayerAddress` on this path: see the header
+      // of circuits/vote_template.circom. A public signal that the verifier
+      // cannot check binds nothing, and adding it made the IC length disagree
+      // with the contract.
       circuitInput = {
         root: input.root,
         nullifier: input.nullifier,
         daoId: input.daoId,
         proposalId: input.proposalId,
         voteChoice: input.voteChoice,
-        relayerAddress: input.relayerAddress,
+        numCandidates: input.numCandidates,
         secret: input.secret,
         salt: input.salt,
+        blindingFactor: input.blindingFactor,
         pathElements: input.pathElements,
         pathIndices: input.pathIndices,
       };
@@ -755,9 +831,9 @@ export async function generateTallyProof(
 
     const { groth16 } = await import("snarkjs");
     const { proof, publicSignals } = await groth16.fullProve(
-      circuitInput,
-      wasmPath,
-      zkeyPath,
+      circuitInput as unknown as CircuitSignals,
+      wasmPath as string,
+      zkeyPath as string,
     );
     return { proof, publicSignals };
   } catch (error) {
@@ -784,6 +860,7 @@ export async function generateBridgeProof(
       voteChoice: input.voteChoice,
       voteRoot: input.voteRoot,
       sbtRoot: input.sbtRoot,
+      chainId: input.chainId ?? "0",
       secret: input.secret,
       salt: input.salt,
       votingPathElements: input.votingPathElements,
@@ -810,8 +887,8 @@ export async function generateBridgeProof(
  */
 export async function generateCommentProof(
   input: CommentProofInput,
-  wasmPath: string = "/circuits/comment/comment.wasm",
-  zkeyPath: string = "/circuits/comment/comment_final.zkey",
+  wasmPath: string | Uint8Array = "/circuits/comment/comment.wasm",
+  zkeyPath: string | Uint8Array = "/circuits/comment/comment_final.zkey",
 ): Promise<GeneratedProof> {
   try {
     const circuitVersion = input.circuitVersion ?? "v1";
@@ -883,6 +960,44 @@ export async function generateCommentProofV2(
     wasmPath,
     zkeyPath,
   );
+}
+
+/**
+ * Generate a Groth16 proof for claim circuit (vote-to-earn)
+ */
+export async function generateClaimProof(
+  input: ClaimProofInput,
+  wasmPath: string | Uint8Array = "/circuits/claim.wasm",
+  zkeyPath: string | Uint8Array = "/circuits/claim_final.zkey",
+): Promise<GeneratedProof> {
+  try {
+    const circuitInput: Record<string, unknown> = {
+      root: input.root,
+      voteNullifier: input.voteNullifier,
+      claimNullifier: input.claimNullifier,
+      daoId: input.daoId,
+      proposalId: input.proposalId,
+      secret: input.secret,
+      salt: input.salt,
+      pathElements: input.pathElements,
+      pathIndices: input.pathIndices,
+    };
+    if (input.blindingFactor) circuitInput.blindingFactor = input.blindingFactor;
+
+    if (USE_RUST_PROVER) {
+      try {
+        return await proveWithRust(circuitInput, wasmPath, zkeyPath);
+      } catch (e) {
+        console.warn("Rust claim prover failed; falling back to snarkjs.", e);
+      }
+    }
+    return proveWithSnarkjs(circuitInput, wasmPath, zkeyPath);
+  } catch (error) {
+    console.error("Failed to generate claim proof:", error);
+    throw new Error(
+      `Claim proof generation failed: ${error instanceof Error ? error.message : "Unknown error"}`,
+    );
+  }
 }
 
 /**
@@ -979,7 +1094,7 @@ export async function calculateNullifierV2(
   proposalId: string,
   chainId: string,
 ): Promise<string> {
-  return calculateNullifier(secret, daoId, proposalId, "v2", chainId);
+  return calculateNullifier(secret, daoId, proposalId, chainId);
 }
 
 /**
@@ -1099,6 +1214,7 @@ export async function verifyProofWithVersionedVK(
 ): Promise<boolean> {
   const vkEntry = await fetchVersionedVK(circuitId, version);
   try {
+    const { groth16 } = await import("snarkjs");
     const result = await groth16.verify(
       vkEntry.verificationKey as never,
       publicSignals,

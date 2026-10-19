@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "./ui/Button";
 import Alert from "./ui/Alert";
 import type { StellarWalletsKit } from "@creit.tech/stellar-wallets-kit";
@@ -11,16 +12,20 @@ import {
   calculateNullifier,
   type ProofInput,
 } from "../lib/zkproof";
+import { assertValidNullifier, assertValidFieldElement } from "../types/index";
 import { fetchWithProgress } from "../lib/fetchWithProgress";
+import { provingPreflightError } from "../lib/devicePreflight";
 import { getMerklePath } from "../lib/merkletree";
 import { useOptimisticVote } from "../queries/proposalQueries";
+import { isWrongNetwork, type RelayerStatus } from "../queries/relayerQueries";
+import { queryKeys } from "../lib/queryClient";
 import {
   generateDeterministicZKCredentials,
   generateFakeZKCredentials,
   getZKCredentials,
   storeZKCredentials,
 } from "../lib/zk";
-import { submissionQueue } from "../store/submissionQueue";
+import { submissionQueue, type VotePayload } from "../store/submissionQueue";
 import { processEntry } from "../lib/queueProcessor";
 import { CheckCircle, XCircle, AlertTriangle, Loader2, X, WifiOff } from "lucide-react";
 import { useReceipts } from "../hooks/useReceipts";
@@ -36,6 +41,17 @@ interface VoteModalProps {
    * default — means the election uses the default circuit (#93).
    */
   merkleDepth?: number;
+  /**
+   * Candidate count bound into the vote circuit public signals.
+   * Must match on-chain `ElectionConfig.num_candidates` (#645).
+   *
+   * Leave undefined to have this component read the value the contract will
+   * verify against (`get_effective_num_candidates`), which is the only way to
+   * be sure the two agree. A hardcoded default of 2 silently disagrees with any
+   * election that configured a different count. Pass a value only when the
+   * caller already knows it.
+   */
+  numCandidates?: number;
   daoId: number;
   publicKey: string;
   kit: StellarWalletsKit | null;
@@ -51,6 +67,7 @@ export default function VoteModal({
   voteMode,
   vkVersion: _vkVersion,
   merkleDepth = 0,
+  numCandidates,
   daoId,
   publicKey,
   kit,
@@ -61,14 +78,35 @@ export default function VoteModal({
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState("");
   const [isOfflineQueued, setIsOfflineQueued] = useState(false);
+  const [panicMode, setPanicMode] = useState(false);
   const { addReceipt } = useReceipts();
   const { setOptimisticVote, clearPendingVote } = useOptimisticVote();
+  const queryClient = useQueryClient();
+
+  // Escape closes the dialog, the same as clicking the backdrop
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
 
   const handleVote = async (choice: boolean) => {
     setStep("generating");
     setError(null);
 
     try {
+      // Fail before the expensive proving step if the relayer is on another network
+      const relayer = queryClient.getQueryData<{ status: RelayerStatus }>(
+        queryKeys.relayer.status(),
+      );
+      if (isWrongNetwork(relayer?.status)) {
+        throw new Error(
+          "The relayer is connected to a different Stellar network than this app, so your vote could not be counted. Voting is blocked until they match.",
+        );
+      }
+
       // Initialize contract clients
       const clients = getZkVoteClient(publicKey);
 
@@ -201,6 +239,8 @@ export default function VoteModal({
       // needs the artifacts built for Vote(N); the default circuit's are used
       // when the election declares no depth (#93).
       const artifacts = resolveCircuitUrls(merkleDepth);
+      const preflightError = provingPreflightError();
+      if (preflightError) throw new Error(preflightError);
       const zkey = await fetchWithProgress(
         artifacts.zkeyUrl,
         ({ loadedBytes, totalBytes }) => {
@@ -215,6 +255,25 @@ export default function VoteModal({
       // Step 4b: Generate ZK proof
       setProgress("Generating zero-knowledge proof...");
 
+      // The circuit constrains `voteChoice < numCandidates` against this PUBLIC
+      // signal, and the contract verifies the proof with the same value. It
+      // cannot be omitted: at 0 the constraint is unsatisfiable and no witness
+      // exists.
+      //
+      // The contract is the source of truth — it knows the configured count and
+      // floors at 2 for a binary ballot. A caller-supplied `numCandidates` prop
+      // wins when provided, so a caller that already knows the value does not
+      // pay for the read.
+      let effectiveNumCandidates = numCandidates;
+      if (effectiveNumCandidates === undefined) {
+        const numCandidatesResult =
+          await clients.voting.get_effective_num_candidates({
+            dao_id: BigInt(daoId),
+            proposal_id: BigInt(proposalId),
+          });
+        effectiveNumCandidates = numCandidatesResult.result;
+      }
+
       const proofInput: ProofInput = {
         // Public signals
         root: root.toString(),
@@ -222,6 +281,10 @@ export default function VoteModal({
         daoId: daoId.toString(),
         proposalId: proposalId.toString(),
         voteChoice: choice ? "1" : "0",
+        // Must match on-chain ElectionConfig.num_candidates. The contract is
+        // the source of truth; a caller-supplied `numCandidates` prop wins when
+        // provided.
+        numCandidates: effectiveNumCandidates.toString(),
         commitment: commitment.toString(), // Private input - computed in circuit, not exposed publicly
         // Note: vkVersion is NOT a circuit signal - it's checked on-chain only
         // Private signals
@@ -256,7 +319,7 @@ export default function VoteModal({
 
       if (!isValid) {
         throw new Error(
-          "Proof verification failed locally! This indicates a bug in proof generation.",
+          "Local proof verification failed. Circuit artifacts may be missing or mismatched (check /circuits/vote.wasm and verification_key.json), or the witness may be incomplete.",
         );
       }
 
@@ -277,7 +340,7 @@ export default function VoteModal({
         return bigInt.toString(16).padStart(64, "0");
       };
 
-      const votePayload = {
+      let votePayload: VotePayload & { redundantProof?: unknown } = {
         daoId: Number(daoId),
         proposalId: Number(proposalId),
         choice: choice,
@@ -298,59 +361,10 @@ export default function VoteModal({
             }
           : {}),
         timestamp: Date.now(),
-      };
+      } as VotePayload & { redundantProof?: unknown };
 
-      // Sign the vote payload with the voter's Stellar keypair
-      let voterSignature: string | undefined;
-      try {
-        setProgress("Signing vote with your wallet...");
-        const { signVotePayload } = await import("../services/freighter");
-        const { getFreighterNetworkDetails } =
-          await import("../services/freighter");
-        const networkDetails = await getFreighterNetworkDetails();
-        const networkPassphrase =
-          networkDetails?.networkPassphrase ||
-          "Public Global Stellar Network ; September 2015";
-
-        const payloadToSign = JSON.stringify({
-          daoId: Number(daoId),
-          proposalId: Number(proposalId),
-          choice,
-          nullifier: toHexBE(nullifier),
-          root: toHexBE(root),
-          timestamp: Date.now(),
-        });
-        voterSignature = await signVotePayload(
-          payloadToSign,
-          publicKey,
-          networkPassphrase,
-        );
-
-        if (import.meta.env.DEV) {
-          console.log("Vote payload signed:", {
-            signature: voterSignature.slice(0, 16) + "...",
-          });
-        }
-      } catch (err) {
-        console.warn("Failed to sign vote payload:", err);
-        // Continue without signature - backend will still accept it with relayer auth token
-      }
-
-      const votePayload = {
-        daoId: Number(daoId),
-        proposalId: Number(proposalId),
-        choice: choice,
-        nullifier: toHexBE(nullifier),
-        root: toHexBE(root),
-        proof: {
-          a: proof_a,
-          b: proof_b,
-          c: proof_c,
-        },
-        timestamp: Date.now(),
-        voterPublicKey: publicKey,
-        voterSignature,
-      };
+      // Do not attach voterPublicKey / voterSignature — that links the wallet
+      // to the nullifier and ballot in transit and in localStorage (#644).
 
       // Step 7: Deduplication check — if this nullifier is already in the
       // queue as submitted or conflict, surface that to the user.
@@ -373,7 +387,7 @@ export default function VoteModal({
         }
       }
 
-      // Optimistic update — show success UI before the network round-trip
+      // Optimistic tally preview — reverted if submission does not land
       const revertOptimisticUpdate = setOptimisticVote(
         daoId,
         proposalId,
@@ -393,43 +407,55 @@ export default function VoteModal({
         return;
       }
 
-      // Step 9: Attempt immediate submission via queue processor
+      // Step 9: Await submission — only show success when the relay accepts (#646)
       setProgress("Submitting anonymous vote through relay...");
-      setStep("success");
+      setStep("submitting");
+
+      await processEntry(entry);
+
+      const finalEntry =
+        submissionQueue.getState().entries[votePayload.nullifier];
+
+      if (finalEntry?.status === "submitted") {
+        if (finalEntry.txHash) {
+          addReceipt({
+            txHash: finalEntry.txHash,
+            nullifier: votePayload.nullifier,
+            timestamp: Date.now(),
+            daoId: Number(daoId),
+            proposalId: Number(proposalId),
+          });
+        }
+        clearPendingVote(daoId, proposalId);
+        setStep("success");
+        onComplete();
+        return;
+      }
+
+      if (finalEntry?.status === "conflict") {
+        revertOptimisticUpdate();
+        setStep("error");
+        setError(
+          finalEntry.conflictDetail ||
+            "You have already voted on this proposal.",
+        );
+        return;
+      }
+
+      if (finalEntry?.status === "failed") {
+        revertOptimisticUpdate();
+        setStep("error");
+        setError(
+          finalEntry.lastError ||
+            "Vote submission failed. Please try again.",
+        );
+        return;
+      }
+
+      // pending / retryable — keep optimistic preview, show queued UI
+      setIsOfflineQueued(false);
+      setStep("queued");
       onComplete();
-
-      // Submit in background via the queue processor
-      processEntry(entry)
-        .then(() => {
-          // Read final state from the queue
-          const finalEntry = submissionQueue.getState().entries[votePayload.nullifier];
-          if (!finalEntry) return;
-
-          if (finalEntry.status === "submitted") {
-            if (finalEntry.txHash) {
-              addReceipt({
-                txHash: finalEntry.txHash,
-                nullifier: votePayload.nullifier,
-                timestamp: Date.now(),
-                daoId: Number(daoId),
-                proposalId: Number(proposalId),
-              });
-            }
-            clearPendingVote(daoId, proposalId);
-          } else if (finalEntry.status === "conflict") {
-            // Conflict: this nullifier was already used.
-            // The SubmissionQueueBanner will surface the conflict notification.
-            revertOptimisticUpdate();
-          } else if (finalEntry.status === "failed") {
-            // Permanent failure
-            revertOptimisticUpdate();
-          }
-          // For "pending" (retryable): leave optimistic update in place,
-          // the queue processor will retry automatically.
-        })
-        .catch(() => {
-          // processEntry never throws — errors are recorded in the queue entry
-        });
     } catch (err) {
       setStep("error");
       let errorMsg =
@@ -523,7 +549,7 @@ export default function VoteModal({
                     aria-label={
                       panicMode ? "Disable panic mode" : "Enable panic mode"
                     }
-                    onClick={() => setPanicMode((prev) => !prev)}
+                    onClick={() => setPanicMode((prev: boolean) => !prev)}
                     className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-yellow-500 ${
                       panicMode ? "bg-yellow-500" : "bg-muted"
                     }`}

@@ -1,22 +1,52 @@
 /**
  * Structured Logger Service with PII Redaction
+ *
+ * Provides:
+ *  - Structured JSON logging to stdout
+ *  - PII redaction (field- and pattern-based)
+ *  - Per-request correlation context via AsyncLocalStorage so every nested
+ *    log call carries the request's correlation ID + trace ID automatically
+ *  - Trace sampling (`LOG_SAMPLE_RATE`) so high-volume requests can be
+ *    probabilistically dropped while keeping an entire request consistent
  */
 import crypto from "crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 const DEFAULT_POLICY = {
     redactedFields: [
         "proof",
         "nullifier",
         "commitment",
+        "commitment_hash",
+        "blinding_factor",
+        "blindingfactor",
+        "blinding",
+        "salt",
         "secret",
+        "secret_key",
+        "relayer_secret_key",
+        "relayer_auth_token",
+        "x-relayer-auth",
+        "master_key",
+        "auth_token",
         "token",
         "password",
         "jwt",
+        "pinata_jwt",
+        "web3_storage_token",
         "refresh_token",
         "access_token",
         "api_key",
         "private_key",
         "seed",
         "mnemonic",
+        "session",
+        "capability",
+        "vkey",
+        "verification_key",
+        "threshold",
+        "tally",
+        "ciphertext",
+        "relay_metadata",
     ],
     detailedLevels: ["debug"],
     showClientIp: "hash",
@@ -24,6 +54,75 @@ const DEFAULT_POLICY = {
     stellarTruncateLength: 4,
 };
 let currentPolicy = { ...DEFAULT_POLICY };
+// Correlation context store: auto-attaches request correlation IDs to every
+// log call made within a request's async execution context.
+const requestContextStore = new AsyncLocalStorage();
+/**
+ * Runs `fn` within the given correlation context. Every log call made
+ * synchronously or asynchronously (via awaited promises, timers, etc.)
+ * spawned from `fn` will automatically include `ctx` and `traceId`.
+ */
+export function runWithContext(context, fn) {
+    return requestContextStore.run(context, fn);
+}
+/**
+ * Returns the correlation context active for the current async execution,
+ * or `undefined` when no request context is present (e.g. background jobs).
+ */
+export function getRequestContext() {
+    return requestContextStore.getStore();
+}
+/**
+ * Trace sampling rate in [0, 1]. Defaults to 1 (log everything). Set via
+ * `LOG_SAMPLE_RATE` env or `setLogSampleRate` (tests/tuning).
+ */
+let sampleRate = clampSampleRate(parseFloat(process.env.LOG_SAMPLE_RATE || "1"));
+function clampSampleRate(value) {
+    if (Number.isNaN(value))
+        return 1;
+    return Math.min(1, Math.max(0, value));
+}
+export function setLogSampleRate(rate) {
+    sampleRate = clampSampleRate(rate);
+}
+export function getLogSampleRate() {
+    return sampleRate;
+}
+/**
+ * Applies sampling deterministically keyed on the request's trace ID (or
+ * correlation ID) so a single request is either fully sampled or fully
+ * dropped - keeping start/end spans and nested logs consistent.
+ */
+function shouldEmit(event, meta) {
+    if (sampleRate >= 1)
+        return true;
+    if (sampleRate <= 0)
+        return false;
+    const context = getRequestContext();
+    const key = meta.traceId ?? meta.ctx ?? context?.traceId ?? context?.ctx ?? event;
+    let hash = 0;
+    for (let i = 0; i < key.length; i++) {
+        hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
+    }
+    return (hash % 100) / 100 < sampleRate;
+}
+/**
+ * Merges the active correlation context into the log meta so downstream
+ * log calls (services/routes) automatically carry correlation IDs without
+ * threading `req` manually. Explicit meta values win over context.
+ */
+function withCorrelation(meta) {
+    const context = getRequestContext();
+    if (!context)
+        return meta;
+    return {
+        ...meta,
+        ctx: meta.ctx ?? context.ctx,
+        traceId: meta.traceId ?? context.traceId,
+        path: meta.path ?? context.path,
+        method: meta.method ?? context.method,
+    };
+}
 export function setRedactionPolicy(policy) {
     currentPolicy = { ...currentPolicy, ...policy };
 }
@@ -91,11 +190,14 @@ export function redact(meta, level = "info") {
     }
     return safe;
 }
+function isEnabled(level) {
+    const minLevel = (process.env.LOG_LEVEL || "info");
+    const levels = ["debug", "info", "warn", "error"];
+    return levels.indexOf(level) >= levels.indexOf(minLevel);
+}
 export function createLogger(service) {
     const log = (level, event, meta = {}) => {
-        const minLevel = (process.env.LOG_LEVEL || "info");
-        const levels = ["debug", "info", "warn", "error"];
-        if (levels.indexOf(level) < levels.indexOf(minLevel)) {
+        if (!shouldEmit(event, meta) || !isEnabled(level)) {
             return;
         }
         const redactedMeta = redact(meta, level);
@@ -105,7 +207,7 @@ export function createLogger(service) {
             service,
             event,
             env: process.env.NODE_ENV || "development",
-            ...redactedMeta,
+            ...withCorrelation(redactedMeta),
         };
         console.log(JSON.stringify(entry));
     };
@@ -121,25 +223,25 @@ export function generateRequestId() {
     return crypto.randomBytes(6).toString("hex");
 }
 export function hashIp(ip) {
+    // Salt prevents rainbow-table recovery of IPv4 from truncated SHA-256 (#644).
+    const salt = process.env.IP_HASH_SALT || "";
     return crypto
         .createHash("sha256")
-        .update(ip || "")
+        .update(`${salt}|${ip || ""}`)
         .digest("hex")
         .slice(0, 12);
 }
 export function log(level, event, meta = {}) {
-    const safe = redact(meta, level);
-    const minLevel = (process.env.LOG_LEVEL || "info");
-    const levels = ["debug", "info", "warn", "error"];
-    if (levels.indexOf(level) < levels.indexOf(minLevel)) {
+    if (!shouldEmit(event, meta) || !isEnabled(level)) {
         return;
     }
+    const safe = redact(meta, level);
     console.log(JSON.stringify({
         level,
         event,
         ts: new Date().toISOString(),
         env: process.env.NODE_ENV || "development",
-        ...safe,
+        ...withCorrelation(safe),
     }));
 }
 export const logger = createLogger(process.env.SERVICE_NAME || "relayer");

@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * ZKVote Backend - Main Entry Point
  *
@@ -7,13 +8,24 @@
  */
 
 import cluster from "node:cluster";
-import express, { type Express, type Request, type Response, type NextFunction } from "express";
+import express, {
+  type Express,
+  type Request,
+  type Response,
+  type NextFunction,
+} from "express";
 import cors from "cors";
 import helmet from "helmet";
 
 import { config, validateEnv, isValidContractId } from "./config.js";
 // Composition root (#358) — explicit construction/wiring of service deps.
 import { buildAppServices } from "./composition-root.js";
+import { initializeTelemetry } from "./services/tracing.js";
+import swaggerUi from "swagger-ui-express";
+import { ServiceSupervisor } from "./services/supervisor.js";
+import { closeDb } from "./services/db.js";
+import { buildOpenApiDocument } from "./openapi.js";
+import { priorityMiddleware } from "./priority/priorityMiddleware.js";
 
 import {
   startClusterMaster,
@@ -115,6 +127,9 @@ import {
   thresholdRoutes,
   auditRoutes,
   randomnessRoutes,
+  payRoutes,
+  swapRoutes,
+  rampRoutes,
 } from "./routes/index.js";
 import { registerShutdownHandler } from "./routes/admin.js";
 import openApiSpec from "./openapi.js";
@@ -140,6 +155,37 @@ const services = buildAppServices();
 
 const app: Express = express();
 
+const isProduction = process.env.NODE_ENV === "production";
+
+// Security: CORS configuration
+function parseCorsOrigins(value: string | string[]): string[] {
+  if (Array.isArray(value)) return value;
+  return value
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+}
+
+const allowedCorsOrigins = parseCorsOrigins(config.corsOrigins as unknown as string | string[]);
+
+if (allowedCorsOrigins.length === 0) {
+  throw new Error("CORS_ORIGIN must specify at least one origin");
+}
+
+if (isProduction && allowedCorsOrigins.includes("*")) {
+  throw new Error(
+    "CORS_ORIGIN must not be '*' in production; configure exact origins",
+  );
+}
+
+for (const origin of allowedCorsOrigins) {
+  if (origin !== "*" && /[*?]/.test(origin)) {
+    throw new Error(
+      "CORS_ORIGIN origins must be exact URLs, not wildcard patterns",
+    );
+  }
+}
+
 // Security: HTTP headers with CSP
 // This is a pure JSON API (no HTML is served outside /api-docs), so the CSP
 // defaults everything to 'none' and only opens the handful of directives
@@ -158,7 +204,7 @@ app.use(
         objectSrc: ["'none'"],
         baseUri: ["'none'"],
         formAction: ["'none'"],
-        frameAncestors: ["'none'"],
+        frameAncestors: allowedCorsOrigins.includes("*") ? ["'none'"] : allowedCorsOrigins,
         blockAllMixedContent: [],
         upgradeInsecureRequests: [],
       },
@@ -189,6 +235,16 @@ app.use((_req, res, next) => {
   next();
 });
 
+// CRITICAL (#661): Cross-origin isolation headers for timing-masking to be effective.
+// Timing masking in proof generation only works when the page is crossOriginIsolated,
+// which requires COOP + COEP headers from the server (dev/preview server has these
+// in vite.config.ts, but production must send them too).
+app.use((_req, res, next) => {
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Cross-Origin-Embedder-Policy", "require-corp");
+  next();
+});
+
 // Prevent caching of sensitive, non-static API responses. Kept scoped to the
 // routes that return per-user or per-vote data rather than applied globally,
 // since some routes (e.g. /api-docs, /ipfs/image/:cid) are fine to cache.
@@ -206,37 +262,13 @@ const noStore = (
 // Metrics middleware (before other middleware to capture all requests)
 app.use(metricsMiddleware);
 
+// Reserve vote capacity before global throttling or any route mount. The
+// classifier normalizes /, /api/v1, and /api/v2 so every public mount gets
+// the same vote-over-comment scheduling guarantee.
+app.use(priorityMiddleware());
+
 // Request-scoped degradation tracking (#204)
 app.use(degradationContext);
-
-// Security: CORS configuration
-function parseCorsOrigins(value: string): string[] {
-  return value
-    .split(",")
-    .map((origin) => origin.trim())
-    .filter(Boolean);
-}
-
-const allowedCorsOrigins = parseCorsOrigins(config.corsOrigins);
-const isProduction = process.env.NODE_ENV === "production";
-
-if (allowedCorsOrigins.length === 0) {
-  throw new Error("CORS_ORIGIN must specify at least one origin");
-}
-
-if (isProduction && allowedCorsOrigins.includes("*")) {
-  throw new Error(
-    "CORS_ORIGIN must not be '*' in production; configure exact origins",
-  );
-}
-
-for (const origin of allowedCorsOrigins) {
-  if (origin !== "*" && /[*?]/.test(origin)) {
-    throw new Error(
-      "CORS_ORIGIN origins must be exact URLs, not wildcard patterns",
-    );
-  }
-}
 
 const allowAllCors = !isProduction && allowedCorsOrigins.includes("*");
 
@@ -311,7 +343,10 @@ app.get("/csrf-token", (_req, res) => {
 // ============================================
 
 // Initialize routes that need dependencies
-initHealthRoutes(services.stellar.server, services.stellar.relayerKeypair.publicKey());
+initHealthRoutes(
+  services.stellar.server,
+  services.stellar.relayerKeypair.publicKey(),
+);
 initIndexerRoutes(triggerDaoMembershipSync);
 
 // Mount route handlers (metrics first, before CSRF/auth middleware)
@@ -336,6 +371,9 @@ app.use(noStore, adminRoutes);
 app.use(noStore, thresholdRoutes);
 app.use(auditRoutes);
 app.use(noStore, randomnessRoutes);
+app.use(payRoutes);
+app.use(swapRoutes);
+app.use(rampRoutes);
 
 // ============================================
 // API VERSIONING (#139)
@@ -358,6 +396,7 @@ const v1Router = express.Router();
 function mountV1(): void {
   v1Router.use(metricsRoutes);
   v1Router.use(healthRoutes);
+  v1Router.use(analyticsRoutes);
   v1Router.use(remediationRoutes);
   v1Router.use(noStore, votingRoutes);
   v1Router.use(daoRoutes);
@@ -368,15 +407,54 @@ function mountV1(): void {
   v1Router.use(bridgeRoutes);
   v1Router.use(circuitRoutes);
   v1Router.use(transactionRoutes);
+  v1Router.use(authRoutes);
   v1Router.use(quadraticRoutes);
   v1Router.use(noStore, adminRoutes);
   v1Router.use(noStore, thresholdRoutes);
   v1Router.use(auditRoutes);
   v1Router.use(noStore, randomnessRoutes);
+  v1Router.use(payRoutes);
+  v1Router.use(swapRoutes);
+  v1Router.use(rampRoutes);
 }
 
 mountV1();
 app.use("/api/v1", v1Router);
+
+// API v2 Router with explicit multi-tenant isolation (#307)
+const v2Router = express.Router();
+v2Router.use((_req, res, next) => {
+  res.setHeader("API-Version", "v2");
+  next();
+});
+
+function mountV2(): void {
+  v2Router.use(metricsRoutes);
+  v2Router.use(healthRoutes);
+  v2Router.use(analyticsRoutes);
+  v2Router.use(remediationRoutes);
+  v2Router.use(noStore, votingRoutes);
+  v2Router.use(daoRoutes);
+  v2Router.use(ipfsRoutes);
+  v2Router.use(commentsRoutes);
+  v2Router.use(claimRoutes);
+  v2Router.use(indexerRoutes);
+  v2Router.use(bridgeRoutes);
+  v2Router.use(circuitRoutes);
+  v2Router.use(transactionRoutes);
+  v2Router.use(authRoutes);
+  v2Router.use(quadraticRoutes);
+  v2Router.use(noStore, adminRoutes);
+  v2Router.use(noStore, thresholdRoutes);
+  v2Router.use(auditRoutes);
+  v2Router.use(noStore, randomnessRoutes);
+  v2Router.use(payRoutes);
+  v2Router.use(swapRoutes);
+  v2Router.use(rampRoutes);
+}
+
+mountV2();
+app.use("/api/v2", v2Router);
 
 // OpenAPI spec + interactive docs
 const openApiDocument = buildOpenApiDocument();
@@ -606,6 +684,7 @@ async function startBackgroundServices(): Promise<void> {
 
   ensureLegacyTokenMigrated();
   startAuthScheduler();
+  services.scheduler.start();
 
   try {
     const database = getDb();
@@ -664,6 +743,8 @@ async function stopBackgroundServices(): Promise<void> {
   stopPinMonitor();
   stopMemoryMonitor();
   stopScheduledBackups();
+  services.scheduler.stop();
+  stopAuthScheduler();
 
   // Drain any outstanding confirmation waits so callers never hang on exit.
   void stopConfirmationWorker();

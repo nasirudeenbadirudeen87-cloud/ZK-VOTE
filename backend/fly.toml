@@ -26,12 +26,12 @@ kill_timeout = "35s"
 [deploy]
   # Rolling deploy: the new machine must pass its health checks before the
   # old one is stopped, so there's no window with zero healthy instances.
-  # Migrations are NOT run via release_command: the SQLite data volume can
-  # only be attached to one machine at a time, so a separate release
-  # machine couldn't mount it anyway. Migrations already run automatically
-  # on boot in db.ts's initDb() (idempotent, lock-guarded) — see
-  # DEPLOYMENT.md.
+  # release_command runs migration status check before deployment finishes.
   strategy = "rolling"
+  # Hermetic release gate (#599): migration parity check PLUS a native ABI
+  # smoke test so a cached Node 20 better_sqlite3.node layer fails the release
+  # instead of serving 500s from /health at runtime.
+  release_command = "node --enable-source-maps dist/services/migrate.js status && node -e \"require('better-sqlite3'); console.log('release ABI smoke ok')\""
 
 [http_service]
   internal_port = 8080

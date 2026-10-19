@@ -4,7 +4,18 @@
  * Provides rate limiting with IP hashing for privacy.
  * Disabled in test mode (RELAYER_TEST_MODE=true) to allow test suite to run without rate limit interference.
  */
-import type { Request, Response, NextFunction } from "express";
+import type { Request, Response, NextFunction, RequestHandler } from "express";
+/**
+ * Strict CORS options for the `cors` middleware.
+ * Validates against an exact list, restricts methods/headers, caches preflight.
+ */
+export declare const corsOptions: {
+    origin(origin: string | undefined, callback: (err: Error | null, allow?: unknown) => void): void;
+    methods: string[];
+    allowedHeaders: string[];
+    credentials: boolean;
+    maxAge: number;
+};
 interface RateLimitMetricEntry {
     total: number;
     blocked: number;
@@ -38,7 +49,7 @@ export declare function getRateLimitMetrics(): Record<string, RateLimitMetricEnt
 export declare const walletRateLimiter: (_req: Request, _res: Response, next: NextFunction) => void;
 /**
  * Rate limiter for vote submissions
- * 10 votes per minute per IP
+ * 10 votes per minute per wallet
  */
 export declare const voteLimiter: (_req: Request, _res: Response, next: NextFunction) => void;
 /**
@@ -69,8 +80,68 @@ export declare const commentLimiter: (_req: Request, _res: Response, next: NextF
 export declare const graduatedSlowDown: (_req: Request, _res: Response, next: NextFunction) => void;
 /**
  * Rate limiter for vote-to-earn claim submissions
- * 10 claims per minute per IP (same as vote, anonymity-sensitive)
+ * 10 claims per minute per wallet (same as vote, anonymity-sensitive)
  */
 export declare const claimLimiter: (_req: Request, _res: Response, next: NextFunction) => void;
+/**
+ * Rate limiter for blind signature issuance (end-to-end RSA blind-signature
+ * credentials). Limit is intentionally strict to prevent signature farming:
+ * each voter should only need one blind signature per election/campaign.
+ * Keyed by wallet address so rate limit buckets are tied to a pseudonymous
+ * identity, never the raw IP.
+ */
+export declare const blindSignLimiter: (_req: Request, _res: Response, next: NextFunction) => void;
+interface PerMemberLimiterOptions {
+    name: string;
+    max: number;
+    windowMs: number;
+    message: string;
+    onBlocked?: (req: Request, res: Response) => void;
+}
+/**
+ * Build a per-member rate limiter (exports the `commitmentRegistrationLimiter`
+ * singleton below). Exported as a factory so the {@link #371} route tests can
+ * exercise real limiting behavior with a small window without test mode.
+ */
+export declare function createPerMemberLimiter(opts: PerMemberLimiterOptions): RequestHandler;
+/**
+ * Rate limiter for commitment registration submissions, keyed per member.
+ * Config-driven (COMMITMENT_REGISTRATION_RATE_LIMIT /
+ * COMMITMENT_REGISTRATION_RATE_WINDOW_MS); mirrors the on-chain per-member
+ * cooldown in the membership-tree contract (#371).
+ */
+export declare const commitmentRegistrationLimiter: (_req: Request, _res: Response, next: NextFunction) => void;
+/**
+ * Rate limiter for tally proof verification requests.
+ * Verification is public (any observer can check final tallies), but the
+ * endpoint performs expensive SNARK/pairing checks, so it is still capped.
+ */
+export declare const verifyTallyProofLimiter: (_req: Request, _res: Response, next: NextFunction) => void;
+/**
+ * Cost-based rate limiter for batch operations that amplify a single HTTP
+ * request into multiple operations. Prevents bypass of per-IP limits via
+ * batch endpoints (e.g., POST /pay/batch with 100 ops counts as 100 cost).
+ *
+ * Usage:
+ *   router.post('/pay/batch', costBasedLimiter({ maxCost: 100 }), handler)
+ *
+ * The handler must call req.rateLimit.cost(n) to set the cost for the request.
+ */
+export declare function costBasedLimiter(opts: {
+    name: string;
+    maxCost: number;
+    windowMs: number;
+    message: string;
+}): RequestHandler;
+/**
+ * Cost-based limiter for payment batch operations.
+ * Max 100 operations per minute per IP (each op counts as 1 cost).
+ */
+export declare const paymentBatchCostLimiter: (_req: Request, _res: Response, next: NextFunction) => void;
+/**
+ * WebSocket rate limiter for WS connections.
+ * Limits connections per IP to prevent WebSocket flooding.
+ */
+export declare const wsConnectionLimiter: (_req: Request, _res: Response, next: NextFunction) => void;
 export {};
 //# sourceMappingURL=rateLimit.d.ts.map

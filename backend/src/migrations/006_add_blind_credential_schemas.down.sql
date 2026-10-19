@@ -1,1 +1,2 @@
-DROP TABLE IF EXISTS bfind_signature_recuests, issued_credentials;
+DROP TABLE IF EXISTS blind_signature_requests;
+DROP TABLE IF EXISTS issued_credentials;

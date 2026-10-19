@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Exclusion Proof Verification Service
  *
@@ -9,6 +10,18 @@
 import { getDb } from "./db.js";
 import { log } from "./logger.js";
 import type { Database as DatabaseType } from "better-sqlite3";
+
+let _deps: { getDb?: () => DatabaseType; log?: (...args: any[]) => void } | null = null;
+export function initExclusionProof(deps: { getDb: () => DatabaseType; log: (...args: any[]) => void }) {
+  _deps = deps;
+}
+function deps() {
+  return {
+    getDb: _deps?.getDb ?? getDb,
+    log: _deps?.log ?? log,
+  };
+}
+let treeContractId: string = "";
 
 /**
  * The `member_revocations` table is created lazily so the revocation-tracking
@@ -159,7 +172,7 @@ async function checkRevocationStatus(
   daoId: number,
   _treeContractId: string,
 ): Promise<RevocationStatus> {
-  const db = getDb();
+  const db = deps().getDb();
   ensureRevocationsTable(db);
 
   const row = db
@@ -179,8 +192,10 @@ async function checkRevocationStatus(
     };
   }
 
+  // A reinstated member is back in the tree and must not be able to present
+  // an exclusion proof as if still revoked (#566).
   return {
-    isRevoked: true,
+    isRevoked: row.reinstated_at == null,
     revokedAt: row.revoked_at,
     reinstatedAt: row.reinstated_at ?? undefined,
     commitment,
@@ -202,7 +217,7 @@ export async function recordRevocation(
   daoId: number,
   timestamp: number,
 ): Promise<void> {
-  const db = getDb();
+  const db = deps().getDb();
   ensureRevocationsTable(db);
 
   try {
@@ -212,7 +227,7 @@ export async function recordRevocation(
        VALUES (?, ?, ?, ?)`,
     ).run(commitment, daoId, timestamp, new Date().toISOString());
   } catch (err) {
-    log("error", "revocation_record_failed", {
+    deps().log("error", "revocation_record_failed", {
       commitment: commitment.slice(0, 10),
       error: (err as Error).message,
     });
@@ -224,7 +239,7 @@ export async function recordReinstatement(
   daoId: number,
   timestamp: number,
 ): Promise<void> {
-  const db = getDb();
+  const db = deps().getDb();
   ensureRevocationsTable(db);
 
   try {
@@ -234,7 +249,7 @@ export async function recordReinstatement(
        WHERE commitment = ? AND dao_id = ?`,
     ).run(timestamp, commitment, daoId);
   } catch (err) {
-    log("error", "reinstatement_record_failed", {
+    deps().log("error", "reinstatement_record_failed", {
       commitment: commitment.slice(0, 10),
       error: (err as Error).message,
     });

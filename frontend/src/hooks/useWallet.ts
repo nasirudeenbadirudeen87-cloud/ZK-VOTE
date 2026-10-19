@@ -15,6 +15,7 @@ import {
   persistConnectionIntent,
 } from "../services/freighter";
 import { clearAllStores } from "../store";
+import { clearAllQueryCaches } from "../lib/cacheInvalidation";
 
 export interface WalletState {
   publicKey: string | null;
@@ -84,6 +85,9 @@ export function useWallet() {
 
     if (wallet.isConnected) {
       unlistenAccount = listenToAccountChange((newAccount) => {
+        // Server data cached for the previous account must not leak into the
+        // new session (#755).
+        void clearAllQueryCaches();
         if (!newAccount) {
           setWallet((prev) => ({
             ...prev,
@@ -229,19 +233,31 @@ export function useWallet() {
     safeLocalStorageRemove("selectedWalletId");
     persistConnectionIntent(false);
     clearAllStores();
+    void clearAllQueryCaches();
+
+    // Clear all identity and cryptographic secrets from localStorage
+    const secretKeyPatterns = [
+      "zkvote_hd_master_secret",
+      "identity_secret",
+      "private_key",
+      "secret",
+      "mnemonic",
+    ];
 
     // Clear all Stellar Wallets Kit localStorage entries
     // The library stores data with keys prefixed with "SWK" or containing "stellar"
     try {
       if (typeof window !== "undefined" && window.localStorage) {
         Object.keys(localStorage).forEach((key) => {
+          const keyLower = key.toLowerCase();
           if (
             key.startsWith("SWK") ||
-            key.toLowerCase().includes("stellar") ||
-            key.toLowerCase().includes("wallet") ||
-            key.toLowerCase().includes("freighter") ||
-            key.toLowerCase().includes("albedo") ||
-            key.toLowerCase().includes("xbull")
+            keyLower.includes("stellar") ||
+            keyLower.includes("wallet") ||
+            keyLower.includes("freighter") ||
+            keyLower.includes("albedo") ||
+            keyLower.includes("xbull") ||
+            secretKeyPatterns.some((pattern) => keyLower.includes(pattern.toLowerCase()))
           ) {
             localStorage.removeItem(key);
           }

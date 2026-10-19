@@ -229,6 +229,7 @@ export function getMigrationStatus(
  * Returns true if lock acquired, false if already locked.
  */
 function acquireLock(database: DatabaseType): boolean {
+  database.exec("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)");
   const existing = database
     .prepare("SELECT value FROM metadata WHERE key = ?")
     .get(LOCK_KEY) as { value: string } | undefined;
@@ -259,6 +260,7 @@ function acquireLock(database: DatabaseType): boolean {
  * Release the migration lock.
  */
 function releaseLock(database: DatabaseType): void {
+  database.exec("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)");
   database.prepare("DELETE FROM metadata WHERE key = ?").run(LOCK_KEY);
 }
 
@@ -741,6 +743,16 @@ async function cli(): Promise<void> {
 
   const database = new Database(DB_FILE);
   database.pragma("journal_mode = WAL");
+  database.pragma("foreign_keys = ON");
+  database.pragma("busy_timeout = 5000");
+
+  // Verify WAL mode is enabled
+  const journalMode = database.pragma("journal_mode", { simple: true }) as string;
+  if (journalMode !== "wal") {
+    console.warn(`Warning: journal_mode is '${journalMode}', expected 'wal'. WAL may not be enabled.`);
+  } else {
+    console.info("WAL mode verified: journal_mode = wal");
+  }
 
   try {
     switch (command) {

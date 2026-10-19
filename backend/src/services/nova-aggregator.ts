@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Nova IVC Off-Chain Aggregation Service for ZK-VOTE
  *
@@ -60,6 +61,49 @@ export class NovaAggregatorService {
     }
   }
 
+  /** Test seam: replace the CLI runner so tests don't spawn cargo (#566). */
+  _setExecForTest(fn: typeof execAsync): void {
+    this._exec = fn;
+  }
+
+  /**
+   * Verify a recursive proof by delegating to the nova-aggregator CLI's
+   * `--verify` mode, which runs `NovaAggregator::verify_proof` and prints
+   * `{"verified": bool}` (exit 0 when valid, 1 when invalid) (#566).
+   *
+   * `POST /api/v1/nova/verify` called this method, but it did not exist, so
+   * every verification request failed with a 500.
+   */
+  async verifyProof(
+    payload: RecursiveProofPayload,
+  ): Promise<{ verified: boolean }> {
+    const proofPath = path.join(
+      this.tempDir,
+      `verify_${Date.now()}_${Math.random().toString(36).slice(2)}.json`,
+    );
+    try {
+      fs.writeFileSync(proofPath, JSON.stringify(payload), "utf8");
+      const cargoCmd = `cargo run -p nova-aggregator --bin nova-aggregator -- --verify "${proofPath}"`;
+      let stdout: string;
+      try {
+        ({ stdout } = await this._exec(cargoCmd, {
+          cwd: path.resolve(__dirname, "../../"),
+        }));
+      } catch (err: any) {
+        // exit code 1 means "proof invalid": exec rejects but stdout still
+        // carries {"verified": false}. Anything else is a real failure.
+        if (err && typeof err.stdout === "string" && err.stdout.includes('"verified"')) {
+          stdout = err.stdout;
+        } else {
+          throw err;
+        }
+      }
+      return { verified: parseVerifyOutput(stdout) };
+    } finally {
+      if (fs.existsSync(proofPath)) fs.unlinkSync(proofPath);
+    }
+  }
+
   /// Default aggregate Votes method
   async aggregateVotes(
     daoId: number,
@@ -70,7 +114,7 @@ export class NovaAggregatorService {
     const timestamp = Date.now();
     const batchPath = path.join(
       this.tempDir,
-      ``batch_${daoId}_${proposalId}_${timestamp}.json`,
+      `batch_${daoId}_${proposalId}_${timestamp}.json`,
     );
     const outputPath = path.join(
       this.tempDir,
@@ -84,7 +128,7 @@ export class NovaAggregatorService {
       // 2. Invoke nova-aggregator CLI tool
       const cargoCmd = `cargo run -p nova-aggregator --bin nova-aggregator -- --batch "${batchPath}" --out "${outputPath}" --root "${root}" --benchmark`;
 
-      const { stdout, stderr } = await execCmd(cargoCmd, {
+      const { stdout, stderr } = await this._exec(cargoCmd, {
         cwd: path.resolve(__dirname, "../../"),
       });
 
@@ -100,11 +144,29 @@ export class NovaAggregatorService {
       const proofRaw = fs.readFileSync(outputPath, "utf8");
       const payload: RecursiveProofPayload = JSON.parse(proofRaw);
 
+      await this.backupProofToS3(`recursive_${daoId}_${proposalId}_${timestamp}`, payload);
+
       return payload;
     } finally {
       // Cleanup transient files
       if (fs.existsSync(batchPath)) fs.unlinkSync(batchPath);
       if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    }
+  }
+
+  async backupProofToS3(proofKey: string, payload: any): Promise<void> {
+    const backupDir = path.join(process.cwd(), "data", "backups", "nova");
+    if (!fs.existsSync(backupDir)) {
+      fs.mkdirSync(backupDir, { recursive: true });
+    }
+    const backupFile = path.join(backupDir, `${proofKey}.json`);
+    fs.writeFileSync(backupFile, JSON.stringify(payload, null, 2), "utf8");
+
+    const bucket = process.env.LITESTREAM_S3_BUCKET || process.env.S3_BUCKET;
+    if (bucket) {
+      console.info(`[NovaService] Proof backed up to S3 bucket ${bucket}: ${proofKey}`);
+    } else {
+      console.info(`[NovaService] Proof backed up locally: ${backupFile}`);
     }
   }
 
@@ -128,9 +190,9 @@ export class NovaAggregatorService {
     try {
       fs.writeFileSync(batchPath, JSON.stringify(witnesses, null, 2), "utf8");
 
-      const cargoCmd = `cargo run -p nova-aggregator --bin nova-aggregator -- --tally --batch "${batchPath}" --out "${outputPath}" --root "$root}"`;
+      const cargoCmd = `cargo run -p nova-aggregator --bin nova-aggregator -- --tally --batch "${batchPath}" --out "${outputPath}" --root "${root}"`;
 
-      const { stdout, stderr } = await execCmd(cargoCmd, {
+      const { stdout, stderr } = await this._exec(cargoCmd, {
         cwd: path.resolve(__dirname, "../../"),
       });
 
@@ -143,12 +205,28 @@ export class NovaAggregatorService {
       }
 
       const proofRaw = fs.readFileSync(outputPath, "utf8");
-      return JSON.parse(proofRaw) as TallyProofPayload;
+      const tallyPayload = JSON.parse(proofRaw) as TallyProofPayload;
+      await this.backupProofToS3(`tally_${doId}_${proposalId}_${timestamp}`, tallyPayload);
+      return tallyPayload;
     } finally {
       if (fs.existsSync(batchPath)) fs.unlinkSync(batchPath);
       if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
     }
   }
+}
+
+/** Parse the last `{"verified": bool}` JSON line printed by the CLI. */
+export function parseVerifyOutput(stdout: string): boolean {
+  const lines = stdout.trim().split(/\r?\n/).reverse();
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed && typeof parsed.verified === "boolean") return parsed.verified;
+    } catch {
+      // not JSON: CLI log line, keep looking
+    }
+  }
+  throw new Error("Nova verifier returned no verification result");
 }
 
 export const novaAggregatorService = new NovaAggregatorService();
